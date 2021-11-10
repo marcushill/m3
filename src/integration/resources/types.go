@@ -62,6 +62,8 @@ type Coordinator interface {
 	InstantQuery(req QueryRequest, headers map[string][]string) (model.Vector, error)
 	// RangeQuery runs a range query with provided headers
 	RangeQuery(req RangeQueryRequest, headers map[string][]string) (model.Matrix, error)
+	// GraphiteQuery retrieves graphite raw data.
+	GraphiteQuery(GraphiteQueryRequest) ([]Datapoint, error)
 }
 
 // Admin is a wrapper for admin functions.
@@ -278,4 +280,22 @@ type RangeQueryRequest struct {
 	EndTime time.Time
 	// Step is the query resolution step width. It is default to 15 seconds.
 	Step time.Duration
+}
+
+// GraphiteQueryRequest represents a graphite render query request.
+type GraphiteQueryRequest struct {
+	// Target speicifies a path identifying one or several metrics.
+	Target string
+	// From is the beginning of the time period to query.
+	From time.Time
+	// Until is the end of the time period to query.
+	Until time.Time
+}
+
+// Datapoint is a data point returned by the graphite render query.
+type Datapoint struct {
+	// Value is the value of the datapoint.
+	Value *float64
+	// Timestamp is the timestamp (in seconds) of the datapoint.
+	Timestamp int64
 }

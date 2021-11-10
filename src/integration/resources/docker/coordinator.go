@@ -252,6 +252,11 @@ func (c *coordinator) RangeQuery(
 	return c.client.RangeQuery(req, headers)
 }
 
+// GraphiteQuery retrieves graphite raw data.
+func (c *coordinator) GraphiteQuery(req resources.GraphiteQueryRequest) ([]resources.Datapoint, error) {
+	return c.client.GraphiteQuery(req)
+}
+
 func (c *coordinator) Close() error {
 	if c.resource.closed {
 		return errClosed
