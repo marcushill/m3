@@ -23,8 +23,11 @@
 package prometheus
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +38,7 @@ import (
 
 	"github.com/m3db/m3/src/integration/resources"
 	"github.com/m3db/m3/src/integration/resources/docker"
+	"github.com/m3db/m3/src/query/api/v1/options"
 	"github.com/m3db/m3/src/query/generated/proto/prompb"
 	"github.com/m3db/m3/src/query/storage"
 	"github.com/m3db/m3/src/x/headers"
@@ -66,12 +70,15 @@ lookbackDuration: 10m
 `
 )
 
+// TODO: extract query limit and timeout status code as params to RunTest
+
 // RunTest contains the logic for running the prometheus test.
 func RunTest(t *testing.T, m3 resources.M3Resources, prom resources.ExternalResources) {
 	logger, err := zap.NewDevelopment()
 	require.NoError(t, err)
 
 	logger.Info("running prometheus tests")
+
 	p := prom.(*docker.Prometheus)
 
 	testPrometheusRemoteRead(t, p, logger)
@@ -83,6 +90,14 @@ func RunTest(t *testing.T, m3 resources.M3Resources, prom resources.ExternalReso
 	testPrometheusRemoteWriteRetrictMetricsType(t, m3.Coordinator(), logger)
 	testQueryLookbackApplied(t, m3.Coordinator(), logger)
 	testQueryLimitsApplied(t, m3.Coordinator(), logger)
+	testQueryRestrictMetricsType(t, m3.Coordinator(), logger)
+	testQueryTimeouts(t, m3.Coordinator(), logger)
+	testPrometheusQueryNativeTimeout(t, m3.Coordinator(), logger)
+	testQueryRestrictTags(t, m3.Coordinator(), logger)
+	testPrometheusRemoteWriteMapTags(t, m3.Coordinator(), logger)
+	testSeries(t, m3.Coordinator(), logger)
+	testLabelQueryLimitsApplied(t, m3.Coordinator(), logger)
+	testLabels(t, m3.Coordinator(), logger)
 }
 
 func testPrometheusRemoteRead(t *testing.T, p *docker.Prometheus, logger *zap.Logger) {
@@ -733,6 +748,551 @@ func testQueryLimitsApplied(
 	}, "400")
 }
 
+func testQueryRestrictMetricsType(
+	t *testing.T,
+	coordinator resources.Coordinator,
+	logger *zap.Logger,
+) {
+	logger.Info("test query restrict to unaggregated metrics type (instant)")
+	requireNativeInstantQuerySuccess(t,
+		coordinator,
+		resources.QueryRequest{
+			Query: "bar_metric",
+		},
+		resources.Headers{
+			headers.MetricsTypeHeader: []string{"unaggregated"},
+		},
+		func(res model.Vector) error {
+			if len(res) == 0 {
+				return errors.New("expected results. received none")
+			}
+
+			if res[0].Value != 42.42 {
+				return fmt.Errorf("expected 42.42. received %v", res[0].Value)
+			}
+
+			return nil
+		})
+
+	logger.Info("test query restrict to unaggregated metrics type (range)")
+	requireNativeRangeQuerySuccess(t,
+		coordinator,
+		resources.RangeQueryRequest{
+			Query: "bar_metric",
+			Start: time.Now().Add(-1 * time.Hour),
+			End:   time.Now(),
+			Step:  30 * time.Second,
+		},
+		resources.Headers{
+			headers.MetricsTypeHeader: []string{"unaggregated"},
+		},
+		func(res model.Matrix) error {
+			if len(res) == 0 {
+				return errors.New("expected results. received none")
+			}
+
+			if len(res[0].Values) == 0 {
+				return errors.New("expected values for initial result. received none")
+			}
+
+			if res[0].Values[0].Value != 42.42 {
+				return fmt.Errorf("expected 42.42. received %v", res[0].Values[0].Value)
+			}
+
+			return nil
+		})
+
+	logger.Info("test query restrict to aggregated metrics type (instant)")
+	requireNativeInstantQuerySuccess(t,
+		coordinator,
+		resources.QueryRequest{
+			Query: "bar_metric",
+		},
+		resources.Headers{
+			headers.MetricsTypeHeader:          []string{"aggregated"},
+			headers.MetricsStoragePolicyHeader: []string{"15s:6h"},
+		},
+		func(res model.Vector) error {
+			if len(res) == 0 {
+				return errors.New("expected results. received none")
+			}
+
+			if res[0].Value != 84.84 {
+				return fmt.Errorf("expected 84.84. received %v", res[0].Value)
+			}
+
+			return nil
+		})
+
+	logger.Info("test query restrict to aggregated metrics type (range)")
+	requireNativeRangeQuerySuccess(t,
+		coordinator,
+		resources.RangeQueryRequest{
+			Query: "bar_metric",
+			Start: time.Now().Add(-1 * time.Hour),
+			End:   time.Now(),
+			Step:  30 * time.Second,
+		},
+		resources.Headers{
+			headers.MetricsTypeHeader:          []string{"aggregated"},
+			headers.MetricsStoragePolicyHeader: []string{"15s:6h"},
+		},
+		func(res model.Matrix) error {
+			if len(res) == 0 {
+				return errors.New("expected results. received none")
+			}
+
+			if len(res[0].Values) == 0 {
+				return errors.New("expected values for initial result. received none")
+			}
+
+			if res[0].Values[0].Value != 84.84 {
+				return fmt.Errorf("expected 84.84. received %v", res[0].Values[0].Value)
+			}
+
+			return nil
+		})
+}
+
+func testQueryTimeouts(
+	t *testing.T,
+	coordinator resources.Coordinator,
+	logger *zap.Logger,
+) {
+	tests := func(timeout, message string) {
+		logger.Info(message)
+		requireError(t, func() error {
+			_, err := coordinator.InstantQuery(resources.QueryRequest{
+				Query: "database_write_tagged_success",
+			}, resources.Headers{
+				headers.TimeoutHeader: []string{timeout},
+			})
+			return err
+		}, "504")
+
+		requireError(t, func() error {
+			_, err := coordinator.RangeQuery(resources.RangeQueryRequest{
+				Query: "database_write_tagged_success",
+				Start: time.Unix(0, 0),
+				End:   time.Now(),
+			}, resources.Headers{
+				headers.TimeoutHeader: []string{timeout},
+			})
+			return err
+		}, "504")
+
+		requireError(t, func() error {
+			_, err := coordinator.LabelNames(resources.LabelNamesRequest{},
+				resources.Headers{
+					headers.TimeoutHeader: []string{timeout},
+				})
+			return err
+		}, "504")
+
+		requireError(t, func() error {
+			_, err := coordinator.LabelValues(resources.LabelValuesRequest{
+				LabelName: "__name__",
+			}, resources.Headers{
+				headers.TimeoutHeader: []string{timeout},
+			})
+			return err
+		}, "504")
+	}
+
+	tests("1ns", "test timeouts at the coordinator layer")
+	tests("1ms", "test timeouts at the coordinator -> m3db layer")
+}
+
+func testPrometheusQueryNativeTimeout(
+	t *testing.T,
+	coordinator resources.Coordinator,
+	logger *zap.Logger,
+) {
+	logger.Info("test query gateway timeout (instant)")
+	requireError(t, func() error {
+		_, err := coordinator.InstantQueryWithEngine(resources.QueryRequest{
+			Query: "bar_metric",
+		}, options.M3QueryEngine, resources.Headers{
+			headers.TimeoutHeader:     []string{"1ms"},
+			headers.MetricsTypeHeader: []string{"unaggregated"},
+		})
+		return err
+	}, "504")
+
+	logger.Info("test query gateway timeout (range)")
+	requireError(t, func() error {
+		_, err := coordinator.RangeQueryWithEngine(resources.RangeQueryRequest{
+			Query: "bar_metric",
+			Start: time.Now().Add(-1 * time.Hour),
+			End:   time.Now(),
+			Step:  30 * time.Second,
+		}, options.M3QueryEngine, resources.Headers{
+			headers.TimeoutHeader:     []string{"1ms"},
+			headers.MetricsTypeHeader: []string{"unaggregated"},
+		})
+		return err
+	}, "504")
+}
+
+func testQueryRestrictTags(
+	t *testing.T,
+	coordinator resources.Coordinator,
+	logger *zap.Logger,
+) {
+	// Test the default restrict tags is applied when directly querying
+	// coordinator (restrict tags set to hide any restricted_metrics_type="hidden"
+	// in m3coordinator.yml)
+
+	// First write some hidden metrics.
+	logger.Info("test write with unaggregated metrics type works as expected")
+	require.NoError(t, coordinator.WriteProm("some_hidden_metric", map[string]string{
+		"restricted_metrics_type": "hidden",
+		"foo_tag":                 "foo_tag_value",
+	}, []prompb.Sample{
+		{
+			Value:     42.42,
+			Timestamp: storage.TimeToPromTimestamp(xtime.Now()),
+		},
+	}, nil))
+
+	// Check that we can see them with zero restrictions applied as an
+	// override (we do this check first so that when we test that they
+	// don't appear by default we know that the metrics are already visible).
+	logger.Info("test restrict by tags with header override to remove restrict works")
+	requireInstantQuerySuccess(t, coordinator, resources.QueryRequest{
+		Query: "{restricted_metrics_type=\"hidden\"}",
+	}, resources.Headers{
+		headers.RestrictByTagsJSONHeader: []string{"{}"},
+	}, func(res model.Vector) error {
+		if len(res) != 1 {
+			return fmt.Errorf("expected 1 result, got %v", len(res))
+		}
+		return nil
+	})
+
+	// Now test that the defaults will hide the metrics altogether.
+	logger.Info("test restrict by tags with coordinator defaults")
+	requireInstantQuerySuccess(t, coordinator, resources.QueryRequest{
+		Query: "{restricted_metrics_type=\"hidden\"}",
+	}, nil, func(res model.Vector) error {
+		if len(res) != 0 {
+			return fmt.Errorf("expected no results, got %v", len(res))
+		}
+		return nil
+	})
+}
+
+func testPrometheusRemoteWriteMapTags(
+	t *testing.T,
+	coordinator resources.Coordinator,
+	logger *zap.Logger,
+) {
+	logger.Info("test map tags header works as expected")
+	require.NoError(t, coordinator.WriteProm("bar_metric", nil, []prompb.Sample{
+		{
+			Value:     42.42,
+			Timestamp: storage.TimeToPromTimestamp(xtime.Now()),
+		},
+	}, resources.Headers{
+		headers.MetricsTypeHeader:   []string{"unaggregated"},
+		headers.MapTagsByJSONHeader: []string{`{"tagMappers":[{"write":{"tag":"globaltag","value":"somevalue"}}]}`},
+	}))
+
+	requireNativeInstantQuerySuccess(t, coordinator, resources.QueryRequest{
+		Query: "bar_metric",
+	}, resources.Headers{
+		headers.MetricsTypeHeader: []string{"unaggregated"},
+	}, func(res model.Vector) error {
+		if len(res) == 0 {
+			return errors.New("expecting results, got none")
+		}
+
+		if val, ok := res[0].Metric["globaltag"]; !ok || val != "somevalue" {
+			return fmt.Errorf("expected metric with globaltag=somevalue, got=%+v", res[0].Metric)
+		}
+
+		return nil
+	})
+}
+
+func testSeries(t *testing.T, coordinator resources.Coordinator, logger *zap.Logger) {
+	logger.Info("test series match endpoint")
+	requireSeriesSuccess(t, coordinator, resources.SeriesRequest{
+		MetadataRequest: resources.MetadataRequest{
+			Match: "prometheus_remote_storage_samples_total",
+			Start: time.Unix(0, 0),
+			End:   time.Now().Add(1 * time.Hour),
+		},
+	}, nil, func(res []model.Metric) error {
+		if len(res) != 1 {
+			return fmt.Errorf("expected 1 result, got %v", len(res))
+		}
+		return nil
+	})
+
+	requireSeriesSuccess(t, coordinator, resources.SeriesRequest{
+		MetadataRequest: resources.MetadataRequest{
+			Match: "prometheus_remote_storage_samples_total",
+		},
+	}, nil, func(res []model.Metric) error {
+		if len(res) != 1 {
+			return fmt.Errorf("expected 1 result, got %v", len(res))
+		}
+		return nil
+	})
+
+	// NB(nate): Use raw RunQuery method here since we want to use a custom format for start
+	// and end
+	queryAndParms := "api/v1/series?match[]=prometheus_remote_storage_samples_total&start=" +
+		"-292273086-05-16T16:47:06Z&end=292277025-08-18T07:12:54.999999999Z"
+	require.NoError(t, coordinator.RunQuery(
+		func(status int, headers map[string][]string, resp string, err error) error {
+			if status != http.StatusOK {
+				return fmt.Errorf("expected 200, got %d. body=%v", status, resp)
+			}
+			var parsedResp seriesResponse
+			if err := json.Unmarshal([]byte(resp), &parsedResp); err != nil {
+				return err
+			}
+
+			if len(parsedResp.Data) != 1 {
+				return fmt.Errorf("expected 1 result, got %d", len(parsedResp.Data))
+			}
+
+			return nil
+		}, queryAndParms, nil))
+}
+
+func testLabelQueryLimitsApplied(
+	t *testing.T,
+	coordinator resources.Coordinator,
+	logger *zap.Logger,
+) {
+	logger.Info("test label limits with require-exhaustive headers true " +
+		"(below limit therefore no error)")
+	requireLabelValuesSuccess(t,
+		coordinator,
+		resources.LabelValuesRequest{
+			LabelName: "__name__",
+		},
+		resources.Headers{
+			headers.LimitMaxSeriesHeader:         []string{"10000"},
+			headers.LimitRequireExhaustiveHeader: []string{"true"},
+		},
+		func(res model.LabelValues) error {
+			// NB(nate): just checking for a 200 and this method only gets called in that case
+			return nil
+		})
+
+	logger.Info("test label series limit with coordinator limit header (default " +
+		"requires exhaustive so error)")
+	requireError(t, func() error {
+		_, err := coordinator.LabelValues(resources.LabelValuesRequest{
+			LabelName: "__name__",
+		}, resources.Headers{
+			headers.LimitMaxSeriesHeader: []string{"1"},
+		})
+		return err
+	}, "query exceeded limit")
+
+	logger.Info("test label series limit with require-exhaustive headers false")
+	requireLabelValuesSuccess(t,
+		coordinator,
+		resources.LabelValuesRequest{
+			LabelName: "__name__",
+		},
+		resources.Headers{
+			headers.LimitMaxSeriesHeader:         []string{"2"},
+			headers.LimitRequireExhaustiveHeader: []string{"false"},
+		},
+		func(res model.LabelValues) error {
+			if len(res) != 1 {
+				return fmt.Errorf("expected 1 result, got %d", len(res))
+			}
+			return nil
+		})
+
+	logger.Info("Test label series limit with require-exhaustive headers " +
+		"true (above limit therefore error)")
+	requireError(t, func() error {
+		_, err := coordinator.LabelValues(resources.LabelValuesRequest{
+			LabelName: "__name__",
+		}, resources.Headers{
+			headers.LimitMaxSeriesHeader:         []string{"2"},
+			headers.LimitRequireExhaustiveHeader: []string{"true"},
+		})
+		return err
+	}, "query exceeded limit")
+	requireError(t, func() error {
+		_, err := coordinator.LabelValues(resources.LabelValuesRequest{
+			LabelName: "__name__",
+		}, resources.Headers{
+			headers.LimitMaxSeriesHeader:         []string{"2"},
+			headers.LimitRequireExhaustiveHeader: []string{"true"},
+		})
+		return err
+	}, "400")
+
+	logger.Info("test label docs limit with coordinator limit header " +
+		"(default requires exhaustive so error)")
+	requireError(t, func() error {
+		_, err := coordinator.LabelValues(resources.LabelValuesRequest{
+			LabelName: "__name__",
+		}, resources.Headers{
+			headers.LimitMaxDocsHeader: []string{"1"},
+		})
+		return err
+	}, "query exceeded limit")
+
+	logger.Info("test label docs limit with require-exhaustive headers false")
+	requireLabelValuesSuccess(t,
+		coordinator,
+		resources.LabelValuesRequest{
+			LabelName: "__name__",
+		},
+		resources.Headers{
+			headers.LimitMaxDocsHeader:           []string{"2"},
+			headers.LimitRequireExhaustiveHeader: []string{"false"},
+		},
+		func(res model.LabelValues) error {
+			if len(res) != 1 {
+				return fmt.Errorf("expected 1 result, got %d", len(res))
+			}
+			return nil
+		})
+
+	logger.Info("Test label docs limit with require-exhaustive headers " +
+		"true (above limit therefore error)")
+	requireError(t, func() error {
+		_, err := coordinator.LabelValues(resources.LabelValuesRequest{
+			LabelName: "__name__",
+		}, resources.Headers{
+			headers.LimitMaxSeriesHeader:         []string{"1"},
+			headers.LimitRequireExhaustiveHeader: []string{"true"},
+		})
+		return err
+	}, "query exceeded limit")
+	requireError(t, func() error {
+		_, err := coordinator.LabelValues(resources.LabelValuesRequest{
+			LabelName: "__name__",
+		}, resources.Headers{
+			headers.LimitMaxSeriesHeader:         []string{"1"},
+			headers.LimitRequireExhaustiveHeader: []string{"true"},
+		})
+		return err
+	}, "400")
+}
+
+func testLabels(
+	t *testing.T,
+	coordinator resources.Coordinator,
+	logger *zap.Logger,
+) {
+	logger.Info("test label APIs")
+	require.NoError(t, coordinator.WriteProm("label_metric", map[string]string{
+		"name_0": "value_0_1",
+		"name_1": "value_1_1",
+		"name_2": "value_2_1",
+	}, []prompb.Sample{
+		{
+			Value:     42.42,
+			Timestamp: storage.TimeToPromTimestamp(xtime.Now()),
+		},
+	}, nil))
+
+	require.NoError(t, coordinator.WriteProm("label_metric_2", map[string]string{
+		"name_0": "value_0_2",
+		"name_1": "value_1_2",
+	}, []prompb.Sample{
+		{
+			Value:     42.42,
+			Timestamp: storage.TimeToPromTimestamp(xtime.Now()),
+		},
+	}, nil))
+
+	requireLabelNamesSuccess(t, coordinator, resources.LabelNamesRequest{}, nil,
+		func(res model.LabelNames) error {
+			var nameLabels model.LabelNames
+			for _, label := range res {
+				matched, err := regexp.MatchString("name_[012]", string(label))
+				if err != nil {
+					return err
+				}
+				if matched {
+					nameLabels = append(nameLabels, label)
+				}
+			}
+			if len(nameLabels) != 3 {
+				return fmt.Errorf("expected 3 results, got %d", len(nameLabels))
+			}
+			return nil
+		})
+
+	requireLabelNamesSuccess(t, coordinator, resources.LabelNamesRequest{
+		MetadataRequest: resources.MetadataRequest{
+			Match: "label_metric",
+		},
+	}, nil, func(res model.LabelNames) error {
+		if len(res) != 4 {
+			return fmt.Errorf("expected 4 results, got %d", len(res))
+		}
+		return nil
+	})
+
+	requireLabelNamesSuccess(t, coordinator, resources.LabelNamesRequest{
+		MetadataRequest: resources.MetadataRequest{
+			Match: "label_metric_2",
+		},
+	}, nil, func(res model.LabelNames) error {
+		if len(res) != 3 {
+			return fmt.Errorf("expected 3 results, got %d", len(res))
+		}
+		return nil
+	})
+
+	requireLabelValuesSuccess(t, coordinator, resources.LabelValuesRequest{
+		LabelName: "name_1",
+	}, nil, func(res model.LabelValues) error {
+		if len(res) != 2 {
+			return fmt.Errorf("expected 2 results, got %d", len(res))
+		}
+		return nil
+	})
+
+	tests := func(match string, length int, val string) {
+		requireLabelValuesSuccess(t, coordinator, resources.LabelValuesRequest{
+			MetadataRequest: resources.MetadataRequest{
+				Match: match,
+			},
+			LabelName: "name_1",
+		}, nil, func(res model.LabelValues) error {
+			if len(res) != length {
+				return fmt.Errorf("expected %d results, got %d", length, len(res))
+			}
+			return nil
+		})
+
+		requireLabelValuesSuccess(t, coordinator, resources.LabelValuesRequest{
+			MetadataRequest: resources.MetadataRequest{
+				Match: match,
+			},
+			LabelName: "name_1",
+		}, nil, func(res model.LabelValues) error {
+			if string(res[0]) != val {
+				return fmt.Errorf("expected %s, got %s", val, res[0])
+			}
+			return nil
+		})
+	}
+	tests("label_metric", 1, "value_1_1")
+	tests("label_metric_2", 1, "value_1_2")
+}
+
+type seriesResponse struct {
+	Status string
+	Data   []map[string]string
+}
+
 func requireError(t *testing.T, query func() error, errorMsg string) {
 	require.NoError(t, resources.Retry(func() error {
 		if err := query(); err != nil {
@@ -767,6 +1327,23 @@ func requireInstantQuerySuccess(
 	}))
 }
 
+func requireNativeInstantQuerySuccess(
+	t *testing.T,
+	coordinator resources.Coordinator,
+	request resources.QueryRequest,
+	headers resources.Headers,
+	successCond func(res model.Vector) error,
+) {
+	require.NoError(t, resources.Retry(func() error {
+		res, err := coordinator.InstantQueryWithEngine(request, options.M3QueryEngine, headers)
+		if err != nil {
+			return err
+		}
+
+		return successCond(res)
+	}))
+}
+
 func requireRangeQuerySuccess(
 	t *testing.T,
 	coordinator resources.Coordinator,
@@ -784,6 +1361,23 @@ func requireRangeQuerySuccess(
 	}))
 }
 
+func requireNativeRangeQuerySuccess(
+	t *testing.T,
+	coordinator resources.Coordinator,
+	request resources.RangeQueryRequest,
+	headers resources.Headers,
+	successCond func(res model.Matrix) error,
+) {
+	require.NoError(t, resources.Retry(func() error {
+		res, err := coordinator.RangeQueryWithEngine(request, options.M3QueryEngine, headers)
+		if err != nil {
+			return err
+		}
+
+		return successCond(res)
+	}))
+}
+
 func requireLabelValuesSuccess(
 	t *testing.T,
 	coordinator resources.Coordinator,
@@ -793,6 +1387,40 @@ func requireLabelValuesSuccess(
 ) {
 	require.NoError(t, resources.Retry(func() error {
 		res, err := coordinator.LabelValues(request, headers)
+		if err != nil {
+			return err
+		}
+
+		return successCond(res)
+	}))
+}
+
+func requireLabelNamesSuccess(
+	t *testing.T,
+	coordinator resources.Coordinator,
+	request resources.LabelNamesRequest,
+	headers resources.Headers,
+	successCond func(res model.LabelNames) error,
+) {
+	require.NoError(t, resources.Retry(func() error {
+		res, err := coordinator.LabelNames(request, headers)
+		if err != nil {
+			return err
+		}
+
+		return successCond(res)
+	}))
+}
+
+func requireSeriesSuccess(
+	t *testing.T,
+	coordinator resources.Coordinator,
+	request resources.SeriesRequest,
+	headers resources.Headers,
+	successCond func(res []model.Metric) error,
+) {
+	require.NoError(t, resources.Retry(func() error {
+		res, err := coordinator.Series(request, headers)
 		if err != nil {
 			return err
 		}
