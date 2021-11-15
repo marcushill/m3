@@ -39,6 +39,7 @@ import (
 	"github.com/m3db/m3/src/cmd/services/m3query/config"
 	"github.com/m3db/m3/src/integration/resources"
 	nettest "github.com/m3db/m3/src/integration/resources/net"
+	"github.com/m3db/m3/src/query/api/v1/options"
 	"github.com/m3db/m3/src/query/generated/proto/admin"
 	"github.com/m3db/m3/src/query/generated/proto/prompb"
 	"github.com/m3db/m3/src/query/server"
@@ -447,12 +448,32 @@ func (c *Coordinator) InstantQuery(
 	return c.client.InstantQuery(req, headers)
 }
 
+// InstantQueryWithEngine runs an instant query with provided headers and the specified
+// query engine.
+func (c *Coordinator) InstantQueryWithEngine(
+	req resources.QueryRequest,
+	engine options.QueryEngine,
+	headers resources.Headers,
+) (model.Vector, error) {
+	return c.client.InstantQueryWithEngine(req, engine, headers)
+}
+
 // RangeQuery runs a range query with provided headers
 func (c *Coordinator) RangeQuery(
 	req resources.RangeQueryRequest,
 	headers resources.Headers,
 ) (model.Matrix, error) {
 	return c.client.RangeQuery(req, headers)
+}
+
+// RangeQueryWithEngine runs a range query with provided headers and the specified
+// query engine.
+func (c *Coordinator) RangeQueryWithEngine(
+	req resources.RangeQueryRequest,
+	engine options.QueryEngine,
+	headers resources.Headers,
+) (model.Matrix, error) {
+	return c.client.RangeQueryWithEngine(req, engine, headers)
 }
 
 // LabelNames return matching label names based on the request.
